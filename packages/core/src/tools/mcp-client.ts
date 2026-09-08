@@ -5,6 +5,7 @@
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import type {
   jsonSchemaValidator,
@@ -20,6 +21,7 @@ import {
   StreamableHTTPClientTransport,
   type StreamableHTTPClientTransportOptions,
 } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { EnvHttpProxyAgent } from 'undici';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   ListResourcesResultSchema,
@@ -27,6 +29,8 @@ import {
   ReadResourceResultSchema,
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
+  ErrorCode,
+  McpError,
   PromptListChangedNotificationSchema,
   ProgressNotificationSchema,
   type GetPromptResult,
@@ -45,16 +49,18 @@ import {
 import { GoogleCredentialProvider } from '../mcp/google-auth-provider.js';
 import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-provider.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
-import { XcodeMcpBridgeFixTransport } from './xcode-mcp-fix-transport.js';
+import { McpComplianceTransport } from './mcp-compliance-transport.js';
 
 import type { CallableTool, FunctionCall, Part, Tool } from '@google/genai';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { McpAuthProvider } from '../mcp/auth-provider.js';
-import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
+import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
+import { DynamicStoredOAuthProvider } from '../mcp/stored-token-provider.js';
 import { OAuthUtils } from '../mcp/oauth-utils.js';
+
 import type { PromptRegistry } from '../prompts/prompt-registry.js';
 import {
   getErrorMessage,
@@ -78,8 +84,10 @@ import { validateMcpPolicyToolNames } from '../policy/toml-loader.js';
 import {
   sanitizeEnvironment,
   type EnvironmentSanitizationConfig,
+  isDangerousExecutionEnvironmentVariable,
 } from '../services/environmentSanitization.js';
 import { expandEnvVars } from '../utils/envExpansion.js';
+
 import {
   GEMINI_CLI_IDENTIFICATION_ENV_VAR,
   GEMINI_CLI_IDENTIFICATION_ENV_VAR_VALUE,
@@ -812,7 +820,7 @@ type StatusChangeListener = (
   serverName: string,
   status: MCPServerStatus,
 ) => void;
-const statusChangeListeners: StatusChangeListener[] = [];
+const statusChangeListeners: Set<StatusChangeListener> = new Set();
 
 /**
  * Add a listener for MCP server status changes
@@ -820,7 +828,7 @@ const statusChangeListeners: StatusChangeListener[] = [];
 export function addMCPStatusChangeListener(
   listener: StatusChangeListener,
 ): void {
-  statusChangeListeners.push(listener);
+  statusChangeListeners.add(listener);
 }
 
 /**
@@ -829,10 +837,7 @@ export function addMCPStatusChangeListener(
 export function removeMCPStatusChangeListener(
   listener: StatusChangeListener,
 ): void {
-  const index = statusChangeListeners.indexOf(listener);
-  if (index !== -1) {
-    statusChangeListeners.splice(index, 1);
-  }
+  statusChangeListeners.delete(listener);
 }
 
 /**
@@ -1026,6 +1031,16 @@ function createAuthProvider(
   }
   return undefined;
 }
+/**
+ * Creates an OAuth token provider for transports so token lookup/refresh happens
+ * at request/auth time instead of freezing a single token at transport creation.
+ */
+function createDynamicOAuthTokenProvider(
+  mcpServerName: string,
+  mcpServerConfig: MCPServerConfig,
+): McpAuthProvider {
+  return new DynamicStoredOAuthProvider(mcpServerName, mcpServerConfig);
+}
 
 /**
  * Create a transport with OAuth token for the given server configuration.
@@ -1041,7 +1056,7 @@ async function createTransportWithOAuth(
   mcpServerConfig: MCPServerConfig,
   accessToken: string,
   cliConfig: McpContext,
-): Promise<StreamableHTTPClientTransport | SSEClientTransport | null> {
+): Promise<Transport | null> {
   try {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${accessToken}`,
@@ -1056,7 +1071,12 @@ async function createTransportWithOAuth(
       ),
     };
 
-    return createUrlTransport(mcpServerName, mcpServerConfig, transportOptions);
+    const transport = createUrlTransport(
+      mcpServerName,
+      mcpServerConfig,
+      transportOptions,
+    );
+    return transport ? new McpComplianceTransport(transport) : null;
   } catch (error) {
     cliConfig.emitMcpDiagnostic(
       'error',
@@ -1129,10 +1149,12 @@ class LenientJsonSchemaValidator implements jsonSchemaValidator {
     try {
       return this.ajvValidator.getValidator<T>(schema);
     } catch (error) {
+      let id = '<no $id>';
+      if (schema && typeof schema === 'object' && '$id' in schema) {
+        id = String(schema.$id);
+      }
       debugLogger.warn(
-        `Failed to compile MCP tool output schema (${
-          (schema as Record<string, unknown>)?.['$id'] ?? '<no $id>'
-        }): ${error instanceof Error ? error.message : String(error)}. ` +
+        `Failed to compile MCP tool output schema (${id}): ${error instanceof Error ? error.message : String(error)}. ` +
           'Skipping output validation for this tool.',
       );
       return (input: unknown) => ({
@@ -1253,6 +1275,10 @@ export async function connectAndDiscover(
   }
 }
 
+function isMcpMethodNotFoundError(error: unknown): boolean {
+  return error instanceof McpError && error.code === ErrorCode.MethodNotFound;
+}
+
 /**
  * Discovers and sanitizes tools from a connected MCP client.
  * It retrieves function declarations from the client, filters out disabled tools,
@@ -1288,6 +1314,46 @@ export async function discoverTools(
       try {
         if (!isEnabled(toolDef, mcpServerName, mcpServerConfig)) {
           continue;
+        }
+
+        if (toolDef.inputSchema) {
+          try {
+            const transform = (obj: unknown): unknown => {
+              if (obj === null || typeof obj !== 'object') return obj;
+              if (Array.isArray(obj)) return obj.map(transform);
+
+              const res = { ...obj } as Record<string, unknown>;
+
+              if (Array.isArray(res['type']) && res['type'].length === 2) {
+                const nIdx = res['type'].indexOf('null');
+                if (nIdx !== -1 && typeof res['type'][1 - nIdx] === 'string') {
+                  res['type'] = res['type'][1 - nIdx];
+                  res['nullable'] = true;
+                }
+              }
+
+              for (const k in res) {
+                if (Object.prototype.hasOwnProperty.call(res, k)) {
+                  res[k] = transform(res[k]);
+                }
+              }
+              return res;
+            };
+
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+            toolDef.inputSchema = transform(toolDef.inputSchema) as {
+              type: 'object';
+              properties?: Record<string, object>;
+              required?: string[];
+            };
+          } catch (error) {
+            cliConfig.emitMcpDiagnostic(
+              'error',
+              `Failed to parse adjusted inputSchema for tool '${toolDef.name}' from server '${mcpServerName}'. Using original schema. Error: ${error instanceof Error ? error.message : String(error)}`,
+              error,
+              mcpServerName,
+            );
+          }
         }
 
         const mcpCallableTool = new McpCallableTool(
@@ -1332,10 +1398,7 @@ export async function discoverTools(
     }
     return discoveredTools;
   } catch (error) {
-    if (
-      error instanceof Error &&
-      !error.message?.includes('Method not found')
-    ) {
+    if (!isMcpMethodNotFoundError(error)) {
       cliConfig.emitMcpDiagnostic(
         'error',
         `Error discovering tools from ${mcpServerName}: ${getErrorMessage(
@@ -1344,6 +1407,7 @@ export async function discoverTools(
         error,
         mcpServerName,
       );
+      throw error;
     }
     return [];
   }
@@ -1459,8 +1523,7 @@ export async function discoverPrompts(
         ),
     }));
   } catch (error) {
-    // It's okay if the method is not found, which is a common case.
-    if (error instanceof Error && error.message?.includes('Method not found')) {
+    if (isMcpMethodNotFoundError(error)) {
       return [];
     }
     cliConfig.emitMcpDiagnostic(
@@ -1508,7 +1571,7 @@ async function listResources(
       cursor = response.nextCursor ?? undefined;
     } while (cursor);
   } catch (error) {
-    if (error instanceof Error && error.message?.includes('Method not found')) {
+    if (isMcpMethodNotFoundError(error)) {
       return [];
     }
     cliConfig.emitMcpDiagnostic(
@@ -1755,7 +1818,11 @@ export interface McpContext {
   setUserInteractedWithMcp?(): void;
   isTrustedFolder(): boolean;
   getPolicyEngine?(): {
-    getRules(): ReadonlyArray<{ toolName?: string; source?: string }>;
+    getRules(): ReadonlyArray<{
+      toolName: string;
+      mcpName?: string;
+      source?: string;
+    }>;
   };
 }
 
@@ -1813,7 +1880,7 @@ export async function connectToMcpServer(
         await mcpClient.notification({
           method: 'notifications/roots/list_changed',
         });
-      } catch (_) {
+      } catch {
         // If this fails, its almost certainly because the connection was closed
         // and we should just stop listening for future directory changes.
         unlistenDirectories?.();
@@ -2120,6 +2187,40 @@ function createUrlTransport(
     | StreamableHTTPClientTransportOptions
     | SSEClientTransportOptions,
 ): StreamableHTTPClientTransport | SSEClientTransport {
+  // Create a proxy-aware fetcher that respects NO_PROXY for this MCP server
+  // This is especially important for local MCP servers (localhost, 127.0.0.1)
+  // when a company proxy is globally configured.
+  const noProxy = process.env['NO_PROXY'] || process.env['no_proxy'];
+  const agent = new EnvHttpProxyAgent({ noProxy });
+
+  // Wrap fetch to:
+  // 1. Use the proxy-aware agent (respecting NO_PROXY)
+  // 2. Treat GET 404 as 405 so servers that do not support the
+  //    optional SSE GET stream (e.g. n8n native MCP) are handled gracefully.
+  // The SDK already silently ignores 405; 404 is semantically equivalent here.
+  const baseFetch =
+    (transportOptions as StreamableHTTPClientTransportOptions).fetch ??
+    globalThis.fetch;
+
+  const httpOptions: StreamableHTTPClientTransportOptions = {
+    ...transportOptions,
+    fetch: async (url, init) => {
+      // If we have an explicit NO_PROXY, we use a proxy-aware dispatcher.
+      // We use the global fetch but pass a custom dispatcher in the init options.
+      // This avoids manual response reconstruction and dangerous type casts.
+      const res = noProxy
+        ? await globalThis.fetch(url, {
+            ...init,
+            dispatcher: agent,
+          } as RequestInit)
+        : await baseFetch(url, init);
+
+      return init?.method === 'GET' && res.status === 404
+        ? new Response(null, { status: 405, statusText: 'Method Not Allowed' })
+        : res;
+    },
+  };
+
   // Priority 1: httpUrl (deprecated)
   if (mcpServerConfig.httpUrl) {
     if (mcpServerConfig.url) {
@@ -2130,7 +2231,7 @@ function createUrlTransport(
     }
     return new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.httpUrl),
-      transportOptions,
+      httpOptions,
     );
   }
 
@@ -2139,7 +2240,7 @@ function createUrlTransport(
     if (mcpServerConfig.type === 'http') {
       return new StreamableHTTPClientTransport(
         new URL(mcpServerConfig.url),
-        transportOptions,
+        httpOptions,
       );
     } else if (mcpServerConfig.type === 'sse') {
       return new SSEClientTransport(
@@ -2153,7 +2254,7 @@ function createUrlTransport(
   if (mcpServerConfig.url) {
     return new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.url),
-      transportOptions,
+      httpOptions,
     );
   }
 
@@ -2186,41 +2287,32 @@ export async function createTransport(
     }
   }
   if (mcpServerConfig.httpUrl || mcpServerConfig.url) {
-    const authProvider = createAuthProvider(mcpServerConfig);
+    let authProvider = createAuthProvider(mcpServerConfig);
     const headers: Record<string, string> =
       (await authProvider?.getRequestHeaders?.()) ?? {};
 
     if (authProvider === undefined) {
-      // Check if we have OAuth configuration or stored tokens
-      let accessToken: string | null = null;
-      if (mcpServerConfig.oauth?.enabled && mcpServerConfig.oauth) {
-        const tokenStorage = new MCPOAuthTokenStorage();
-        const mcpAuthProvider = new MCPOAuthProvider(tokenStorage);
-        accessToken = await mcpAuthProvider.getValidToken(
-          mcpServerName,
-          mcpServerConfig.oauth,
-        );
+      const tokenStorage = new MCPOAuthTokenStorage();
+      const credentials = await tokenStorage.getCredentials(mcpServerName);
+      const shouldUseDynamicOAuthProvider = !!credentials;
 
-        if (!accessToken) {
-          // Emit info message (not error) since this is expected behavior
-          cliConfig.emitMcpDiagnostic(
-            'info',
-            `MCP server '${mcpServerName}' requires authentication using: /mcp auth ${mcpServerName}`,
-            undefined,
-            mcpServerName,
-          );
-        }
-      } else {
-        // Check if we have stored OAuth tokens for this server (from previous authentication)
-        accessToken = await getStoredOAuthToken(mcpServerName);
-        if (accessToken) {
-          debugLogger.log(
-            `Found stored OAuth token for server '${mcpServerName}'`,
-          );
-        }
+      if (!shouldUseDynamicOAuthProvider && mcpServerConfig.oauth?.enabled) {
+        cliConfig.emitMcpDiagnostic(
+          'info',
+          `MCP server '${mcpServerName}' requires authentication using: /mcp auth ${mcpServerName}`,
+          undefined,
+          mcpServerName,
+        );
       }
-      if (accessToken) {
-        headers['Authorization'] = `Bearer ${accessToken}`;
+
+      if (shouldUseDynamicOAuthProvider) {
+        debugLogger.log(
+          `Found stored OAuth token for server '${mcpServerName}'`,
+        );
+        authProvider = createDynamicOAuthTokenProvider(
+          mcpServerName,
+          mcpServerConfig,
+        );
       }
     }
 
@@ -2235,7 +2327,9 @@ export async function createTransport(
       authProvider,
     };
 
-    return createUrlTransport(mcpServerName, mcpServerConfig, transportOptions);
+    return new McpComplianceTransport(
+      createUrlTransport(mcpServerName, mcpServerConfig, transportOptions),
+    );
   }
 
   if (mcpServerConfig.command) {
@@ -2267,36 +2361,36 @@ export async function createTransport(
     // Expand and merge explicit environment variables from the MCP configuration.
     if (mcpServerConfig.env) {
       for (const [key, value] of Object.entries(mcpServerConfig.env)) {
-        finalEnv[key] = expandEnvVars(value, expansionEnv);
+        if (value === undefined) {
+          continue;
+        }
+        if (isDangerousExecutionEnvironmentVariable(key)) {
+          debugLogger.warn(
+            `Blocked dangerous environment variable override for MCP server '${mcpServerName}': ${key}`,
+          );
+          continue;
+        }
+        finalEnv[key] = expandEnvVars(value, sanitizedEnv);
       }
     }
 
-    let transport: Transport = new StdioClientTransport({
-      command: mcpServerConfig.command,
-      args: mcpServerConfig.args || [],
-      env: finalEnv,
-      cwd: mcpServerConfig.cwd,
-      stderr: 'pipe',
-    });
-
-    // Fix for Xcode 26.3 mcpbridge non-compliant responses
-    // It returns JSON in `content` instead of `structuredContent`
-    if (
-      mcpServerConfig.command === 'xcrun' &&
-      mcpServerConfig.args?.includes('mcpbridge')
-    ) {
-      transport = new XcodeMcpBridgeFixTransport(transport);
-    }
+    const transport: Transport = new McpComplianceTransport(
+      new StdioClientTransport({
+        command: mcpServerConfig.command,
+        args: mcpServerConfig.args || [],
+        env: finalEnv,
+        cwd: mcpServerConfig.cwd,
+        stderr: 'pipe',
+      }),
+    );
 
     if (debugMode) {
-      // The `XcodeMcpBridgeFixTransport` wrapper hides the underlying `StdioClientTransport`,
+      // The `McpComplianceTransport` wrapper hides the underlying `StdioClientTransport`,
       // which exposes `stderr` for debug logging. We need to unwrap it to attach the listener.
 
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const underlyingTransport =
-        transport instanceof XcodeMcpBridgeFixTransport
-          ? // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-type-assertion
-            (transport as any).transport
+        transport instanceof McpComplianceTransport
+          ? transport.transport
           : transport;
 
       if (
@@ -2320,7 +2414,6 @@ export async function createTransport(
     `Invalid configuration: missing httpUrl (for Streamable HTTP), url (for SSE), and command (for stdio).`,
   );
 }
-
 interface NamedTool {
   name?: string;
 }
@@ -2331,7 +2424,13 @@ function getExtensionEnvironment(
   const env: Record<string, string> = {};
   if (extension?.resolvedSettings) {
     for (const setting of extension.resolvedSettings) {
-      if (setting.value !== undefined) {
+      if (setting.value !== undefined && typeof setting.envVar === 'string') {
+        if (isDangerousExecutionEnvironmentVariable(setting.envVar)) {
+          debugLogger.warn(
+            `Blocked restricted environment variable override in extension settings: ${setting.envVar}`,
+          );
+          continue;
+        }
         env[setting.envVar] = setting.value;
       }
     }

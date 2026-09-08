@@ -31,6 +31,7 @@ import {
   canLoadServer,
 } from '../../config/mcp/mcpServerEnablement.js';
 import { loadSettings } from '../../config/settings.js';
+import { parseSlashCommand } from '../../utils/commands.js';
 
 const authCommand: SlashCommand = {
   name: 'auth',
@@ -177,6 +178,7 @@ const listAction = async (
   context: CommandContext,
   showDescriptions = false,
   showSchema = false,
+  serverNameFilter?: string,
 ): Promise<void | MessageActionReturn> => {
   const agentContext = context.services.agentContext;
   const config = agentContext?.config;
@@ -199,10 +201,24 @@ const listAction = async (
     };
   }
 
-  const mcpServers = config.getMcpClientManager()?.getMcpServers() || {};
-  const serverNames = Object.keys(mcpServers);
+  let mcpServers = config.getMcpClientManager()?.getMcpServers() || {};
   const blockedMcpServers =
     config.getMcpClientManager()?.getBlockedMcpServers() || [];
+
+  if (serverNameFilter) {
+    const filter = serverNameFilter.trim().toLowerCase();
+    if (filter) {
+      mcpServers = Object.fromEntries(
+        Object.entries(mcpServers).filter(
+          ([name]) =>
+            name.toLowerCase().includes(filter) ||
+            normalizeServerId(name).includes(filter),
+        ),
+      );
+    }
+  }
+
+  const serverNames = Object.keys(mcpServers);
 
   const connectingServers = serverNames.filter(
     (name) => getMCPServerStatus(name) === MCPServerStatus.CONNECTING,
@@ -268,7 +284,8 @@ const listAction = async (
     type: MessageType.MCP_STATUS,
     servers: mcpServers,
     tools: mcpTools.map((tool) => ({
-      serverName: tool.serverName,
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      serverName: (tool as unknown as { serverName: string }).serverName,
       name: tool.name,
       description: tool.description,
       schema: tool.schema,
@@ -306,7 +323,7 @@ const listCommand: SlashCommand = {
   description: 'List configured MCP servers and tools',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
-  action: (context) => listAction(context),
+  action: (context, args) => listAction(context, false, false, args),
 };
 
 const descCommand: SlashCommand = {
@@ -315,7 +332,7 @@ const descCommand: SlashCommand = {
   description: 'List configured MCP servers and tools with descriptions',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
-  action: (context) => listAction(context, true),
+  action: (context, args) => listAction(context, true, false, args),
 };
 
 const schemaCommand: SlashCommand = {
@@ -324,7 +341,7 @@ const schemaCommand: SlashCommand = {
     'List configured MCP servers and tools with descriptions and schemas',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
-  action: (context) => listAction(context, true, true),
+  action: (context, args) => listAction(context, true, true, args),
 };
 
 const reloadCommand: SlashCommand = {
@@ -333,6 +350,7 @@ const reloadCommand: SlashCommand = {
   description: 'Reloads MCP servers',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
+  takesArgs: false,
   action: async (
     context: CommandContext,
   ): Promise<void | SlashCommandActionReturn> => {
@@ -530,5 +548,18 @@ export const mcpCommand: SlashCommand = {
     enableCommand,
     disableCommand,
   ],
-  action: async (context: CommandContext) => listAction(context),
+  action: async (
+    context: CommandContext,
+    args: string,
+  ): Promise<void | SlashCommandActionReturn> => {
+    if (args) {
+      const parsed = parseSlashCommand(`/${args}`, mcpCommand.subCommands!);
+      if (parsed.commandToExecute?.action) {
+        return parsed.commandToExecute.action(context, parsed.args);
+      }
+      // If no subcommand matches, treat the whole args as a filter for list
+      return listAction(context, false, false, args);
+    }
+    return listAction(context);
+  },
 };

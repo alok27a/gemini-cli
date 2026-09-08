@@ -83,6 +83,10 @@ import {
   recordInvalidChunk,
   recordOnboardingStart,
   recordOnboardingSuccess,
+  recordBrowserAgentConnection,
+  recordBrowserAgentVisionStatus,
+  recordBrowserAgentTaskOutcome,
+  recordBrowserAgentCleanup,
 } from './metrics.js';
 import { bufferTelemetryEvent } from './sdk.js';
 import { uiTelemetryService, type UiEvent } from './uiTelemetry.js';
@@ -135,6 +139,7 @@ export function logUserPrompt(config: Config, event: UserPromptEvent): void {
 export function logToolCall(config: Config, event: ToolCallEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_TOOL_CALL,
     'event.timestamp': new Date().toISOString(),
@@ -269,6 +274,7 @@ export function logRipgrepFallback(
 export function logApiError(config: Config, event: ApiErrorEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_API_ERROR,
     'event.timestamp': new Date().toISOString(),
@@ -301,6 +307,7 @@ export function logApiError(config: Config, event: ApiErrorEvent): void {
 export function logApiResponse(config: Config, event: ApiResponseEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_API_RESPONSE,
     'event.timestamp': new Date().toISOString(),
@@ -401,6 +408,7 @@ export function logSlashCommand(
 export function logRewind(config: Config, event: RewindEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_REWIND,
     'event.timestamp': new Date().toISOString(),
@@ -905,7 +913,7 @@ export function logOnboardingSuccess(
     };
     logger.emit(logRecord);
 
-    recordOnboardingSuccess(config, event.userTier);
+    recordOnboardingSuccess(config, event.userTier, event.duration_ms);
   });
 }
 
@@ -934,4 +942,91 @@ export function logBillingEvent(
       cc.logCreditPurchaseClickEvent(event);
     }
   }
+}
+
+// ==========================================================================
+// Browser Agent Events
+// ==========================================================================
+
+export function logBrowserAgentConnection(
+  config: Config,
+  durationMs: number,
+  attributes: {
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    headless: boolean;
+    success: boolean;
+    error_type?:
+      | 'profile_locked'
+      | 'timeout'
+      | 'connection_refused'
+      | 'unknown';
+    tool_count?: number;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentConnectionEvent({
+    session_mode: attributes.session_mode,
+    headless: attributes.headless,
+    success: attributes.success,
+    duration_ms: durationMs,
+    error_type: attributes.error_type,
+    tool_count: attributes.tool_count,
+  });
+
+  recordBrowserAgentConnection(config, durationMs, attributes);
+}
+
+export function logBrowserAgentVisionStatus(
+  config: Config,
+  attributes: {
+    enabled: boolean;
+    disabled_reason?:
+      | 'no_visual_model'
+      | 'missing_visual_tools'
+      | 'blocked_auth_type';
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentVisionStatusEvent({
+    enabled: attributes.enabled,
+    disabled_reason: attributes.disabled_reason,
+  });
+
+  recordBrowserAgentVisionStatus(config, attributes);
+}
+
+export function logBrowserAgentTaskOutcome(
+  config: Config,
+  attributes: {
+    success: boolean;
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    vision_enabled: boolean;
+    headless: boolean;
+    duration_ms: number;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentTaskOutcomeEvent({
+    success: attributes.success,
+    session_mode: attributes.session_mode,
+    vision_enabled: attributes.vision_enabled,
+    headless: attributes.headless,
+    duration_ms: attributes.duration_ms,
+  });
+
+  recordBrowserAgentTaskOutcome(config, attributes);
+}
+
+export function logBrowserAgentCleanup(
+  config: Config,
+  durationMs: number,
+  attributes: {
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    success: boolean;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentCleanupEvent({
+    session_mode: attributes.session_mode,
+    success: attributes.success,
+    duration_ms: durationMs,
+  });
+
+  recordBrowserAgentCleanup(config, durationMs, attributes);
 }

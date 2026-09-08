@@ -29,7 +29,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 describe('worktree utilities', () => {
-  const projectRoot = '/mock/project';
+  const projectRoot = path.resolve('/mock/project');
   const worktreeName = 'test-feature';
   const expectedPath = path.join(
     projectRoot,
@@ -49,12 +49,12 @@ describe('worktree utilities', () => {
         stdout: '.git\n',
       } as never);
 
-      const result = await getProjectRootForWorktree('/mock/project');
-      expect(result).toBe('/mock/project');
+      const result = await getProjectRootForWorktree(projectRoot);
+      expect(result).toBe(projectRoot);
       expect(execa).toHaveBeenCalledWith(
         'git',
         ['rev-parse', '--git-common-dir'],
-        { cwd: '/mock/project' },
+        { cwd: projectRoot, env: expect.anything() },
       );
     });
 
@@ -94,7 +94,7 @@ describe('worktree utilities', () => {
       expect(execa).toHaveBeenCalledWith(
         'git',
         ['worktree', 'add', expectedPath, '-b', `worktree-${worktreeName}`],
-        { cwd: projectRoot },
+        { cwd: projectRoot, env: expect.anything() },
       );
     });
 
@@ -119,7 +119,9 @@ describe('worktree utilities', () => {
       expect(isGeminiWorktree(path.join(projectRoot, 'src'), projectRoot)).toBe(
         false,
       );
-      expect(isGeminiWorktree('/some/other/path', projectRoot)).toBe(false);
+      expect(
+        isGeminiWorktree(path.resolve('/some/other/path'), projectRoot),
+      ).toBe(false);
     });
   });
 
@@ -134,6 +136,7 @@ describe('worktree utilities', () => {
       expect(hasChanges).toBe(true);
       expect(execa).toHaveBeenCalledWith('git', ['status', '--porcelain'], {
         cwd: expectedPath,
+        env: expect.anything(),
       });
     });
 
@@ -193,19 +196,19 @@ describe('worktree utilities', () => {
         1,
         'git',
         ['-C', expectedPath, 'branch', '--show-current'],
-        { cwd: projectRoot },
+        { cwd: projectRoot, env: expect.anything() },
       );
       expect(execa).toHaveBeenNthCalledWith(
         2,
         'git',
         ['worktree', 'remove', expectedPath, '--force'],
-        { cwd: projectRoot },
+        { cwd: projectRoot, env: expect.anything() },
       );
       expect(execa).toHaveBeenNthCalledWith(
         3,
         'git',
         ['branch', '-D', `worktree-${worktreeName}`],
-        { cwd: projectRoot },
+        { cwd: projectRoot, env: expect.anything() },
       );
     });
 
@@ -222,14 +225,14 @@ describe('worktree utilities', () => {
         2,
         'git',
         ['worktree', 'remove', expectedPath, '--force'],
-        { cwd: projectRoot },
+        { cwd: projectRoot, env: expect.anything() },
       );
     });
   });
 });
 
 describe('WorktreeService', () => {
-  const projectRoot = '/mock/project';
+  const projectRoot = path.resolve('/mock/project');
   const service = new WorktreeService(projectRoot);
 
   beforeEach(() => {
@@ -246,6 +249,7 @@ describe('WorktreeService', () => {
 
       expect(execa).toHaveBeenCalledWith('git', ['rev-parse', 'HEAD'], {
         cwd: projectRoot,
+        env: expect.anything(),
       });
       expect(info.name).toBe('feature-x');
       expect(info.baseSha).toBe('current-sha');
@@ -267,7 +271,7 @@ describe('WorktreeService', () => {
   describe('maybeCleanup', () => {
     const info = {
       name: 'feature-x',
-      path: '/mock/project/.gemini/worktrees/feature-x',
+      path: path.join(projectRoot, '.gemini', 'worktrees', 'feature-x'),
       baseSha: 'base-sha',
     };
 

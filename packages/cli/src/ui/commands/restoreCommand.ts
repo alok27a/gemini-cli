@@ -30,7 +30,11 @@ const HistoryItemSchema = z
   })
   .passthrough();
 
-const ToolCallDataSchema = getToolCallDataSchema(HistoryItemSchema);
+/* eslint-disable @typescript-eslint/no-unsafe-type-assertion */
+const ToolCallDataSchema = getToolCallDataSchema(
+  HistoryItemSchema as unknown as Parameters<typeof getToolCallDataSchema>[0],
+);
+/* eslint-enable @typescript-eslint/no-unsafe-type-assertion */
 
 async function restoreAction(
   context: CommandContext,
@@ -151,7 +155,7 @@ async function completion(
     const files = await fs.readdir(checkpointDir);
     const jsonFiles = files.filter((file) => file.endsWith('.json'));
     return getTruncatedCheckpointNames(jsonFiles);
-  } catch (_err) {
+  } catch {
     return [];
   }
 }

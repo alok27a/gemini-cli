@@ -6,6 +6,7 @@
 
 import os from 'node:os';
 import fs from 'node:fs';
+import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { quote } from 'shell-quote';
 import { debugLogger, GEMINI_DIR } from '@google/gemini-cli-core';
@@ -15,12 +16,105 @@ export const SANDBOX_NETWORK_NAME = 'gemini-cli-sandbox';
 export const SANDBOX_PROXY_NAME = 'gemini-cli-sandbox-proxy';
 export const BUILTIN_SEATBELT_PROFILES = [
   'permissive-open',
+  'permissive-closed',
   'permissive-proxied',
   'restrictive-open',
+  'restrictive-closed',
   'restrictive-proxied',
   'strict-open',
   'strict-proxied',
 ];
+
+/**
+ * Known sensitive or credential file names that must not be mounted into the sandbox container.
+ */
+export const SENSITIVE_SETTINGS_FILENAMES = new Set([
+  'oauth_creds.json',
+  'google_accounts.json',
+  'gemini-credentials.json',
+  'mcp-oauth-tokens.json',
+  'a2a-oauth-tokens.json',
+]);
+
+/**
+ * Returns true if the given file or directory path corresponds to credentials or sensitive data
+ * that must not be mounted into the untrusted sandbox container.
+ */
+export function isCredentialOrSensitivePath(
+  targetPath: string,
+  rootDir?: string,
+): boolean {
+  if (rootDir && path.resolve(targetPath) === path.resolve(rootDir)) {
+    return false;
+  }
+  const base = path.basename(targetPath).toLowerCase();
+  if (SENSITIVE_SETTINGS_FILENAMES.has(base)) {
+    return true;
+  }
+  const isRootChild = rootDir
+    ? path.dirname(path.resolve(targetPath)) === path.resolve(rootDir)
+    : true;
+  if (isRootChild && (base === 'history' || base === 'tmp' || base === 'bin')) {
+    return true;
+  }
+  const hasSensitiveSuffix = (s: string) => {
+    if (base === s) return true;
+    if (base.endsWith(s)) {
+      const charBefore = base.charAt(base.length - s.length - 1);
+      return charBefore === '-' || charBefore === '_' || charBefore === '.';
+    }
+    return false;
+  };
+
+  if (
+    base.endsWith('.credentials') ||
+    hasSensitiveSuffix('credentials') ||
+    hasSensitiveSuffix('credentials.json') ||
+    hasSensitiveSuffix('tokens.json') ||
+    hasSensitiveSuffix('token.json') ||
+    hasSensitiveSuffix('token') ||
+    hasSensitiveSuffix('creds.json') ||
+    hasSensitiveSuffix('cred.json') ||
+    base.endsWith('.env') ||
+    base.endsWith('.key') ||
+    base.endsWith('.pem') ||
+    base.endsWith('.p12') ||
+    hasSensitiveSuffix('key.json')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Creates an isolated settings directory in a temporary location, populated with non-sensitive
+ * configuration files from the user settings directory while excluding credential and auth files.
+ */
+export function prepareIsolatedSettingsDir(
+  userSettingsDirOnHost: string,
+): string {
+  const baseTmpDir = os.tmpdir() || '/tmp';
+  const isolatedDir = fs.mkdtempSync(
+    path.join(baseTmpDir, 'gemini-sandbox-settings-'),
+  );
+  fs.chmodSync(isolatedDir, 0o700);
+
+  if (fs.existsSync(userSettingsDirOnHost)) {
+    try {
+      fs.cpSync(userSettingsDirOnHost, isolatedDir, {
+        recursive: true,
+        filter: (source) =>
+          !isCredentialOrSensitivePath(source, userSettingsDirOnHost),
+      });
+    } catch (err) {
+      debugLogger.warn(
+        `Failed to copy user settings to sandbox directory: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return isolatedDir;
+}
 
 export function getContainerPath(hostPath: string): string {
   if (os.platform() !== 'win32') {
@@ -49,22 +143,35 @@ export async function shouldUseCurrentUserInSandbox(): Promise<boolean> {
   if (os.platform() === 'linux') {
     try {
       const osReleaseContent = await readFile('/etc/os-release', 'utf8');
-      if (
-        osReleaseContent.includes('ID=debian') ||
-        osReleaseContent.includes('ID=ubuntu') ||
-        osReleaseContent.match(/^ID_LIKE=.*debian.*/m) || // Covers derivatives
-        osReleaseContent.match(/^ID_LIKE=.*ubuntu.*/m) // Covers derivatives
-      ) {
+      const isSupportedDistro =
+        osReleaseContent.match(
+          /^ID=["']?(?:debian|ubuntu|nixos|arch|fedora|suse|opensuse)/m,
+        ) ||
+        osReleaseContent.match(
+          /^ID_LIKE=["']?.*(?:debian|ubuntu|arch|fedora|suse).*/m,
+        );
+
+      if (isSupportedDistro) {
         debugLogger.log(
-          'Defaulting to use current user UID/GID for Debian/Ubuntu-based Linux.',
+          'Defaulting to use current user UID/GID for supported Linux distribution.',
         );
         return true;
       }
-    } catch (_err) {
+
+      // If we're on Linux but the distro is unrecognized, check for a UID mismatch
+      // that might cause permission issues in the sandbox.
+      const uid = os.userInfo().uid;
+      if (uid !== 1000 && uid !== 0) {
+        debugLogger.warn(
+          `Warning: Host UID mismatch detected (current UID: ${uid}). ` +
+            'If you encounter permission errors in the sandbox, try setting SANDBOX_SET_UID_GID=true.',
+        );
+      }
+    } catch {
       // Silently ignore if /etc/os-release is not found or unreadable.
       // The default (false) will be applied in this case.
       debugLogger.warn(
-        'Warning: Could not read /etc/os-release to auto-detect Debian/Ubuntu for UID/GID default.',
+        'Warning: Could not read /etc/os-release to auto-detect Linux distribution for UID/GID default.',
       );
     }
   }

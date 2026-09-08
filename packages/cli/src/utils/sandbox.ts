@@ -38,7 +38,9 @@ import {
   SANDBOX_NETWORK_NAME,
   SANDBOX_PROXY_NAME,
   BUILTIN_SEATBELT_PROFILES,
+  prepareIsolatedSettingsDir,
 } from './sandboxUtils.js';
+import { BUILTIN_SEATBELT_PROFILE_CONTENTS } from './sandboxBuiltinProfiles.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -55,6 +57,71 @@ export async function start_sandbox(
   });
   patcher.patch();
 
+  let stopProxy: (() => void) | undefined = undefined;
+  let tempProfileFile: string | null = null;
+  let sandboxTmpDir: string | null = null;
+  let isolatedSettingsDir: string | null = null;
+
+  const cleanup = () => {
+    if (isolatedSettingsDir) {
+      const dirToDelete = isolatedSettingsDir;
+      isolatedSettingsDir = null;
+      try {
+        if (fs.existsSync(dirToDelete)) {
+          fs.rmSync(dirToDelete, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (sandboxTmpDir) {
+      const dirToDelete = sandboxTmpDir;
+      sandboxTmpDir = null;
+      try {
+        if (fs.existsSync(dirToDelete)) {
+          fs.rmSync(dirToDelete, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (tempProfileFile) {
+      const fileToDelete = tempProfileFile;
+      tempProfileFile = null;
+      try {
+        if (fs.existsSync(fileToDelete)) {
+          fs.unlinkSync(fileToDelete);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (stopProxy) {
+      try {
+        stopProxy();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const sigintHandler = () => {
+    cleanup();
+    process.off('SIGINT', sigintHandler);
+    process.kill(process.pid, 'SIGINT');
+  };
+
+  const sigtermHandler = () => {
+    cleanup();
+    process.off('SIGTERM', sigtermHandler);
+    process.kill(process.pid, 'SIGTERM');
+  };
+
+  process.on('exit', cleanup);
+  process.on('SIGINT', sigintHandler);
+  process.on('SIGTERM', sigtermHandler);
+
   try {
     if (config.command === 'sandbox-exec') {
       // disallow BUILD_SANDBOX
@@ -68,163 +135,217 @@ export async function start_sandbox(
       let profileFile = fileURLToPath(
         new URL(`sandbox-macos-${profile}.sb`, import.meta.url),
       );
-      // if profile name is not recognized, then look for file under project settings directory
+      // if profile name is not recognized, look in user-level ~/.gemini first,
+      // then fall back to project-level .gemini. path.basename() strips any
+      // directory separators to prevent path traversal via SEATBELT_PROFILE.
       if (!BUILTIN_SEATBELT_PROFILES.includes(profile)) {
-        profileFile = path.join(GEMINI_DIR, `sandbox-macos-${profile}.sb`);
-      }
-      if (!fs.existsSync(profileFile)) {
-        throw new FatalSandboxError(
-          `Missing macos seatbelt profile file '${profileFile}'`,
-        );
-      }
-      debugLogger.log(`using macos seatbelt (profile: ${profile}) ...`);
-      // if DEBUG is set, convert to --inspect-brk in NODE_OPTIONS
-      const nodeOptions = [
-        ...(process.env['DEBUG'] ? ['--inspect-brk'] : []),
-        ...nodeArgs,
-      ].join(' ');
-
-      const args = [
-        '-D',
-        `TARGET_DIR=${fs.realpathSync(process.cwd())}`,
-        '-D',
-        `TMP_DIR=${fs.realpathSync(os.tmpdir())}`,
-        '-D',
-        `HOME_DIR=${fs.realpathSync(homedir())}`,
-        '-D',
-        `CACHE_DIR=${fs.realpathSync((await execAsync('getconf DARWIN_USER_CACHE_DIR')).stdout.trim())}`,
-      ];
-
-      // Add included directories from the workspace context
-      // Always add 5 INCLUDE_DIR parameters to ensure .sb files can reference them
-      const MAX_INCLUDE_DIRS = 5;
-      const targetDir = fs.realpathSync(cliConfig?.getTargetDir() || '');
-      const includedDirs: string[] = [];
-
-      if (cliConfig) {
-        const workspaceContext = cliConfig.getWorkspaceContext();
-        const directories = workspaceContext.getDirectories();
-
-        // Filter out TARGET_DIR
-        for (const dir of directories) {
-          const realDir = fs.realpathSync(dir);
-          if (realDir !== targetDir) {
-            includedDirs.push(realDir);
-          }
-        }
-      }
-
-      // Add custom allowed paths from config
-      if (config.allowedPaths) {
-        for (const hostPath of config.allowedPaths) {
-          if (
-            hostPath &&
-            path.isAbsolute(hostPath) &&
-            fs.existsSync(hostPath)
-          ) {
-            const realDir = fs.realpathSync(hostPath);
-            if (!includedDirs.includes(realDir) && realDir !== targetDir) {
-              includedDirs.push(realDir);
+        const safeProfile = path.basename(profile);
+        const fileName = `sandbox-macos-${safeProfile}.sb`;
+        const userProfileFile = path.join(homedir(), GEMINI_DIR, fileName);
+        const projectProfileFile = path.join(GEMINI_DIR, fileName);
+        profileFile = fs.existsSync(userProfileFile)
+          ? userProfileFile
+          : projectProfileFile;
+      } else {
+        // For builtin profiles, if the file doesn't exist on disk (e.g. bundled or bazel environments),
+        // write the embedded profile content to a temporary file.
+        if (!fs.existsSync(profileFile)) {
+          const content = BUILTIN_SEATBELT_PROFILE_CONTENTS[profile];
+          if (content) {
+            try {
+              const tempDir = fs.realpathSync(os.tmpdir());
+              const rand = randomBytes(8).toString('hex');
+              tempProfileFile = path.join(
+                tempDir,
+                `gemini-sandbox-macos-${profile}-${rand}.sb`,
+              );
+              fs.writeFileSync(tempProfileFile, content, {
+                encoding: 'utf8',
+                mode: 0o600,
+              });
+              profileFile = tempProfileFile;
+            } catch (err) {
+              debugLogger.warn(
+                `Failed to write temporary seatbelt profile: ${err}`,
+              );
             }
           }
         }
       }
 
-      for (let i = 0; i < MAX_INCLUDE_DIRS; i++) {
-        let dirPath = '/dev/null'; // Default to a safe path that won't cause issues
-
-        if (i < includedDirs.length) {
-          dirPath = includedDirs[i];
-        }
-
-        args.push('-D', `INCLUDE_DIR_${i}=${dirPath}`);
-      }
-
-      const finalArgv = cliArgs;
-
-      args.push(
-        '-f',
-        profileFile,
-        'sh',
-        '-c',
-        [
-          `SANDBOX=sandbox-exec`,
-          `NODE_OPTIONS="${nodeOptions}"`,
-          ...finalArgv.map((arg) => quote([arg])),
-        ].join(' '),
-      );
-      // start and set up proxy if GEMINI_SANDBOX_PROXY_COMMAND is set
-      const proxyCommand = process.env['GEMINI_SANDBOX_PROXY_COMMAND'];
-      let proxyProcess: ChildProcess | undefined = undefined;
-      let sandboxProcess: ChildProcess | undefined = undefined;
-      const sandboxEnv = { ...process.env };
-      if (proxyCommand) {
-        const proxy =
-          process.env['HTTPS_PROXY'] ||
-          process.env['https_proxy'] ||
-          process.env['HTTP_PROXY'] ||
-          process.env['http_proxy'] ||
-          'http://localhost:8877';
-        sandboxEnv['HTTPS_PROXY'] = proxy;
-        sandboxEnv['https_proxy'] = proxy; // lower-case can be required, e.g. for curl
-        sandboxEnv['HTTP_PROXY'] = proxy;
-        sandboxEnv['http_proxy'] = proxy;
-        const noProxy = process.env['NO_PROXY'] || process.env['no_proxy'];
-        if (noProxy) {
-          sandboxEnv['NO_PROXY'] = noProxy;
-          sandboxEnv['no_proxy'] = noProxy;
-        }
-        proxyProcess = spawn(proxyCommand, {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          shell: true,
-          detached: true,
-        });
-        // install handlers to stop proxy on exit/signal
-        const stopProxy = () => {
-          debugLogger.log('stopping proxy ...');
-          if (proxyProcess?.pid) {
-            process.kill(-proxyProcess.pid, 'SIGTERM');
-          }
-        };
-        process.off('exit', stopProxy);
-        process.on('exit', stopProxy);
-        process.off('SIGINT', stopProxy);
-        process.on('SIGINT', stopProxy);
-        process.off('SIGTERM', stopProxy);
-        process.on('SIGTERM', stopProxy);
-
-        // commented out as it disrupts ink rendering
-        // proxyProcess.stdout?.on('data', (data) => {
-        //   console.info(data.toString());
-        // });
-        proxyProcess.stderr?.on('data', (data) => {
-          debugLogger.debug(`[PROXY STDERR]: ${data.toString().trim()}`);
-        });
-        proxyProcess.on('close', (code, signal) => {
-          if (sandboxProcess?.pid) {
-            process.kill(-sandboxProcess.pid, 'SIGTERM');
-          }
+      try {
+        if (!fs.existsSync(profileFile)) {
           throw new FatalSandboxError(
-            `Proxy command '${proxyCommand}' exited with code ${code}, signal ${signal}`,
+            `Missing macos seatbelt profile file '${profileFile}'`,
           );
-        });
-        debugLogger.log('waiting for proxy to start ...');
-        await execAsync(
-          `until timeout 0.25 curl -s http://localhost:8877; do sleep 0.25; done`,
+        }
+        debugLogger.log(`using macos seatbelt (profile: ${profile}) ...`);
+        // if DEBUG is set, convert to --inspect-brk in NODE_OPTIONS
+        const nodeOptions = [
+          ...(process.env['DEBUG'] ? ['--inspect-brk'] : []),
+          ...nodeArgs,
+        ].join(' ');
+
+        const hostTmpDir = fs.realpathSync(os.tmpdir());
+        const resolvedTmpDir = fs.mkdtempSync(
+          path.join(hostTmpDir, 'gemini-sandbox-'),
         );
-      }
-      // spawn child and let it inherit stdio
-      process.stdin.pause();
-      sandboxProcess = spawn(config.command, args, {
-        stdio: 'inherit',
-      });
-      return await new Promise((resolve, reject) => {
-        sandboxProcess?.on('error', reject);
-        sandboxProcess?.on('close', (code) => {
-          process.stdin.resume();
-          resolve(code ?? 1);
+        sandboxTmpDir = resolvedTmpDir;
+
+        const args = [
+          '-D',
+          `TARGET_DIR=${fs.realpathSync(process.cwd())}`,
+          '-D',
+          `TMP_DIR=${resolvedTmpDir}`,
+          '-D',
+          `HOME_DIR=${fs.realpathSync(homedir())}`,
+          '-D',
+          `CACHE_DIR=${fs.realpathSync((await execAsync('getconf DARWIN_USER_CACHE_DIR')).stdout.trim())}`,
+        ];
+
+        // Add included directories from the workspace context
+        // Always add 5 INCLUDE_DIR parameters to ensure .sb files can reference them
+        const MAX_INCLUDE_DIRS = 5;
+        const targetDir = fs.realpathSync(cliConfig?.getTargetDir() || '');
+        const includedDirs: string[] = [];
+
+        if (cliConfig) {
+          const workspaceContext = cliConfig.getWorkspaceContext();
+          const directories = workspaceContext.getDirectories();
+
+          // Filter out TARGET_DIR
+          for (const dir of directories) {
+            const realDir = fs.realpathSync(dir);
+            if (realDir !== targetDir) {
+              includedDirs.push(realDir);
+            }
+          }
+        }
+
+        // Add custom allowed paths from config
+        if (config.allowedPaths) {
+          for (const hostPath of config.allowedPaths) {
+            if (
+              hostPath &&
+              path.isAbsolute(hostPath) &&
+              fs.existsSync(hostPath)
+            ) {
+              const realDir = fs.realpathSync(hostPath);
+              if (!includedDirs.includes(realDir) && realDir !== targetDir) {
+                includedDirs.push(realDir);
+              }
+            }
+          }
+        }
+
+        for (let i = 0; i < MAX_INCLUDE_DIRS; i++) {
+          let dirPath = '/dev/null'; // Default to a safe path that won't cause issues
+
+          if (i < includedDirs.length) {
+            dirPath = includedDirs[i];
+          }
+
+          args.push('-D', `INCLUDE_DIR_${i}=${dirPath}`);
+        }
+
+        const finalArgv = cliArgs;
+
+        args.push(
+          '-f',
+          profileFile,
+          'sh',
+          '-c',
+          [
+            `SANDBOX=sandbox-exec`,
+            'TMPDIR=' + quote([resolvedTmpDir]),
+            'TMP=' + quote([resolvedTmpDir]),
+            'TEMP=' + quote([resolvedTmpDir]),
+            'NODE_OPTIONS=' + quote([nodeOptions]),
+            ...finalArgv.map((arg) => quote([arg])),
+          ].join(' '),
+        );
+        // start and set up proxy if GEMINI_SANDBOX_PROXY_COMMAND is set
+        const proxyCommand = process.env['GEMINI_SANDBOX_PROXY_COMMAND'];
+        let proxyProcess: ChildProcess | undefined = undefined;
+        let sandboxProcess: ChildProcess | undefined = undefined;
+        const sandboxEnv = { ...process.env };
+        sandboxEnv['TMPDIR'] = resolvedTmpDir;
+        sandboxEnv['TMP'] = resolvedTmpDir;
+        sandboxEnv['TEMP'] = resolvedTmpDir;
+        if (proxyCommand) {
+          const proxy =
+            process.env['HTTPS_PROXY'] ||
+            process.env['https_proxy'] ||
+            process.env['HTTP_PROXY'] ||
+            process.env['http_proxy'] ||
+            'http://localhost:8877';
+          sandboxEnv['HTTPS_PROXY'] = proxy;
+          sandboxEnv['https_proxy'] = proxy; // lower-case can be required, e.g. for curl
+          sandboxEnv['HTTP_PROXY'] = proxy;
+          sandboxEnv['http_proxy'] = proxy;
+          const noProxy = process.env['NO_PROXY'] || process.env['no_proxy'];
+          if (noProxy) {
+            sandboxEnv['NO_PROXY'] = noProxy;
+            sandboxEnv['no_proxy'] = noProxy;
+          }
+          proxyProcess = spawn(proxyCommand, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: true,
+            detached: true,
+          });
+          // install handlers to stop proxy on exit/signal
+          stopProxy = () => {
+            debugLogger.log('stopping proxy ...');
+            if (proxyProcess?.pid) {
+              try {
+                process.kill(-proxyProcess.pid, 'SIGTERM');
+              } catch {
+                // ignore
+              }
+            }
+          };
+
+          // commented out as it disrupts ink rendering
+          // proxyProcess.stdout?.on('data', (data) => {
+          //   console.info(data.toString());
+          // });
+          proxyProcess.stderr?.on('data', (data) => {
+            debugLogger.debug(`[PROXY STDERR]: ${data.toString().trim()}`);
+          });
+          proxyProcess.on('close', (code, signal) => {
+            if (sandboxProcess?.pid) {
+              process.kill(-sandboxProcess.pid, 'SIGTERM');
+            }
+            throw new FatalSandboxError(
+              `Proxy command '${proxyCommand}' exited with code ${code}, signal ${signal}`,
+            );
+          });
+          debugLogger.log('waiting for proxy to start ...');
+          await execAsync(
+            `until timeout 0.25 curl -s http://localhost:8877; do sleep 0.25; done`,
+          );
+        }
+        // spawn child and let it inherit stdio
+        process.stdin.pause();
+        sandboxProcess = spawn(config.command, args, {
+          stdio: 'inherit',
+          env: sandboxEnv,
         });
-      });
+        return await new Promise((resolve, reject) => {
+          sandboxProcess?.on('error', (err) => {
+            cleanup();
+            reject(err);
+          });
+          sandboxProcess?.on('close', (code) => {
+            process.stdin.resume();
+            cleanup();
+            resolve(code ?? 1);
+          });
+        });
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
     }
 
     if (config.command === 'lxc') {
@@ -303,6 +424,10 @@ export async function start_sandbox(
     // run init binary inside container to forward signals & reap zombies
     const args = ['run', '-i', '--rm', '--init', '--workdir', containerWorkdir];
 
+    // explicitly clear the entrypoint to prevent the container's default
+    // entrypoint from interfering with the CLI's spawn command.
+    args.push('--entrypoint', '');
+
     // add runsc runtime if using runsc
     if (config.command === 'runsc') {
       args.push('--runtime=runsc');
@@ -342,14 +467,13 @@ export async function start_sandbox(
       fs.mkdirSync(userSettingsDirOnHost, { recursive: true });
     }
 
-    args.push(
-      '--volume',
-      `${userSettingsDirOnHost}:${userSettingsDirInSandbox}`,
-    );
+    isolatedSettingsDir = prepareIsolatedSettingsDir(userSettingsDirOnHost);
+
+    args.push('--volume', `${isolatedSettingsDir}:${userSettingsDirInSandbox}`);
     if (userSettingsDirInSandbox !== getContainerPath(userSettingsDirOnHost)) {
       args.push(
         '--volume',
-        `${userSettingsDirOnHost}:${getContainerPath(userSettingsDirOnHost)}`,
+        `${isolatedSettingsDir}:${getContainerPath(userSettingsDirOnHost)}`,
       );
     }
 
@@ -482,27 +606,18 @@ export async function start_sandbox(
       }
     }
 
-    // name container after image, plus random suffix to avoid conflicts
+    // Use a random suffix instead of probing existing containers so concurrent
+    // CLI starts cannot race on the same sequential name.
     const imageName = parseImageName(image);
     const isIntegrationTest =
       process.env['GEMINI_CLI_INTEGRATION_TEST'] === 'true';
-    let containerName;
-    if (isIntegrationTest) {
-      containerName = `gemini-cli-integration-test-${randomBytes(4).toString(
-        'hex',
-      )}`;
-      debugLogger.log(`ContainerName: ${containerName}`);
-    } else {
-      let index = 0;
-      const containerNameCheck = (
-        await execAsync(`${command} ps -a --format "{{.Names}}"`)
-      ).stdout.trim();
-      while (containerNameCheck.includes(`${imageName}-${index}`)) {
-        index++;
-      }
-      containerName = `${imageName}-${index}`;
-      debugLogger.log(`ContainerName (regular): ${containerName}`);
-    }
+    const containerNamePrefix = isIntegrationTest
+      ? 'gemini-cli-integration-test'
+      : imageName;
+    const containerName = `${containerNamePrefix}-${randomBytes(6).toString(
+      'hex',
+    )}`;
+    debugLogger.log(`ContainerName: ${containerName}`);
     args.push('--name', containerName, '--hostname', containerName);
 
     // copy GEMINI_CLI_TEST_VAR for integration tests
@@ -674,22 +789,34 @@ export async function start_sandbox(
       // container's /etc/passwd file, which is required by os.userInfo().
       const username = 'gemini';
       const homeDir = getContainerPath(homedir());
-
-      const setupUserCommands = [
-        // Use -f with groupadd to avoid errors if the group already exists.
-        `groupadd -f -g ${gid} ${username}`,
-        // Create user only if it doesn't exist. Use -o for non-unique UID.
-        `id -u ${username} &>/dev/null || useradd -o -u ${uid} -g ${gid} -d ${homeDir} -s /bin/bash ${username}`,
-      ].join(' && ');
+      const quotedHomeDir = quote([homeDir]);
 
       const originalCommand = finalEntrypoint[2];
       const escapedOriginalCommand = originalCommand.replace(/'/g, "'\\''");
 
-      // Use `su -p` to preserve the environment.
-      const suCommand = `su -p ${username} -c '${escapedOriginalCommand}'`;
+      // Use defensive entrypoint logic that checks for useradd availability.
+      // This ensures we can support UID/GID mapping on distros that have these
+      // tools. If useradd is missing (e.g. on minimal images), we fail explicitly
+      // to avoid insecurely falling back to root execution with host mounts.
+      const defensiveEntrypoint = [
+        `if command -v useradd >/dev/null 2>&1; then`,
+        `  (groupadd -g ${gid} -o ${username} 2>/dev/null || true) &&`,
+        `  (id ${uid} >/dev/null 2>&1 || useradd -o -u ${uid} -g ${gid} -d ${quotedHomeDir} -s /bin/bash ${username} 2>/dev/null || true) &&`,
+        `  USER_NAME=$(id -nu ${uid} 2>/dev/null);`,
+        `  if [ -n "$USER_NAME" ]; then`,
+        `    su -p "$USER_NAME" -c '${escapedOriginalCommand}';`,
+        `  else`,
+        `    echo "Error: Failed to map host UID ${uid} to a user in the container." >&2;`,
+        `    exit 1;`,
+        `  fi`,
+        `else`,
+        `  echo "Error: 'useradd' not found in container. UID/GID mapping is required for Linux distros like NixOS/Arch to avoid permission issues. Please use a container image that includes standard user management tools (like 'ubuntu' or 'debian')." >&2;`,
+        `  exit 1;`,
+        `fi`,
+      ].join('\n');
 
       // The entrypoint is always `['bash', '-c', '<command>']`, so we modify the command part.
-      finalEntrypoint[2] = `${setupUserCommands} && ${suCommand}`;
+      finalEntrypoint[2] = defensiveEntrypoint;
 
       // We still need userFlag for the simpler proxy container, which does not have this issue.
       userFlag = `--user ${uid}:${gid}`;
@@ -714,6 +841,8 @@ export async function start_sandbox(
         'run',
         '--rm',
         '--init',
+        '--entrypoint',
+        '',
         ...(userFlag ? userFlag.split(' ') : []),
         '--name',
         SANDBOX_PROXY_NAME,
@@ -738,16 +867,16 @@ export async function start_sandbox(
         detached: true,
       });
       // install handlers to stop proxy on exit/signal
-      const stopProxy = () => {
+      stopProxy = () => {
         debugLogger.log('stopping proxy container ...');
-        execSync(`${command} rm -f ${SANDBOX_PROXY_NAME}`);
+        try {
+          spawnSync(command, ['rm', '-f', SANDBOX_PROXY_NAME], {
+            stdio: 'ignore',
+          });
+        } catch {
+          // ignore
+        }
       };
-      process.off('exit', stopProxy);
-      process.on('exit', stopProxy);
-      process.off('SIGINT', stopProxy);
-      process.on('SIGINT', stopProxy);
-      process.off('SIGTERM', stopProxy);
-      process.on('SIGTERM', stopProxy);
 
       // commented out as it disrupts ink rendering
       // proxyProcess.stdout?.on('data', (data) => {
@@ -782,7 +911,7 @@ export async function start_sandbox(
     });
 
     return await new Promise<number>((resolve, reject) => {
-      sandboxProcess.on('error', (err) => {
+      sandboxProcess?.on('error', (err) => {
         coreEvents.emitFeedback('error', 'Sandbox process error', err);
         reject(err);
       });
@@ -798,6 +927,10 @@ export async function start_sandbox(
       });
     });
   } finally {
+    process.off('exit', cleanup);
+    process.off('SIGINT', sigintHandler);
+    process.off('SIGTERM', sigtermHandler);
+    cleanup();
     patcher.cleanup();
   }
 }
